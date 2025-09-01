@@ -3,6 +3,7 @@ import logging
 import os
 import pickle
 import time
+import json
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import ray
@@ -54,6 +55,7 @@ from ray.serve._private.utils import (
     get_all_live_placement_group_names,
     get_head_node_id,
     is_grpc_enabled,
+    get_capacity_adjusted_num_replicas,
 )
 from ray.serve.config import HTTPOptions, ProxyLocation, gRPCOptions
 from ray.serve.generated.serve_pb2 import (
@@ -75,6 +77,8 @@ from ray.serve.schema import (
     ServeInstanceDetails,
     TargetGroup,
     gRPCOptionsSchema,
+    ScalingDecision,
+    AutoscalingMetricsHealth,
 )
 from ray.util import metrics
 
@@ -222,6 +226,9 @@ class ServeController:
         # Nodes where proxy actors should run.
         self._proxy_nodes = set()
         self._update_proxy_nodes()
+        # Cache last-emitted autoscaling snapshot per (app, deployment)
+        self._last_autoscaling_snapshots = {}
+        self._scaling_decisions = {}
 
     def reconfigure_global_logging_config(self, global_logging_config: LoggingConfig):
         if (
@@ -375,6 +382,216 @@ class ServeController:
         new_proxy_nodes.add(self._controller_node_id)
         self._proxy_nodes = new_proxy_nodes
 
+    def _emit_deployment_autoscaling_snapshots(self) -> None:
+        """Emit a single structured snapshot log per autoscaling-enabled deployment.
+
+        This uses existing state from Deployment/Application managers and the
+        AutoscalingStateManager — no extra state is stored.
+        """
+        try:
+            # Walk all applications and their deployment details.
+            app_statuses = self.application_state_manager.list_app_statuses()
+            for app_name in app_statuses.keys():
+                deployment_details = (
+                    self.application_state_manager.list_deployment_details(app_name)
+                )
+                for dep_name, details in deployment_details.items():
+                    # Only log deployments with autoscaling enabled
+                    autoscaling_config = details.deployment_config.autoscaling_config
+                    if not autoscaling_config:
+                        continue
+
+                    # Current/target replica count
+                    current_replicas = len(getattr(details, "replicas", []) or [])
+                    raw_target = getattr(details, "target_num_replicas", None)
+                    current_target = (
+                        int(raw_target) if raw_target is not None else current_replicas
+                    )
+
+                    # Get snapshot from Autoscaler to avoid duplicate computation
+                    dep_id = DeploymentID(name=dep_name, app_name=app_name)
+                    snapshot = (
+                        self.autoscaling_state_manager.get_observability_snapshot(
+                            dep_id, current_target
+                        )
+                    )
+                    current_replicas = snapshot["current_replicas"]
+                    proposed_replicas = snapshot["proposed_replicas"]
+                    min_repl_adj = snapshot["min_replicas"]
+                    max_repl_adj = snapshot["max_replicas"]
+                    total_requests = snapshot["total_requests"]
+
+                    # Scaling status
+                    if proposed_replicas > current_replicas:
+                        scaling_status = "UPSCALING"
+                    elif proposed_replicas < current_replicas:
+                        scaling_status = "DOWNSCALING"
+                    else:
+                        scaling_status = "STABLE"
+
+                    # ScalingDecision record (keep last 50)
+                    decision = ScalingDecision(
+                        timestamp_s=time.time(),
+                        reason=f"current={current_replicas}, proposed={proposed_replicas}",
+                        from_replicas=int(current_replicas),
+                        to_replicas=int(proposed_replicas),
+                        policy="default",
+                    )
+                    self._scaling_decisions.setdefault(dep_id, []).append(decision)
+                    if len(self._scaling_decisions[dep_id]) > 50:
+                        self._scaling_decisions[dep_id] = self._scaling_decisions[
+                            dep_id
+                        ][-50:]
+
+                    # Skip log if nothing changed (spam prevention)
+                    key = (app_name, dep_name)
+                    signature = (
+                        int(current_replicas),
+                        int(proposed_replicas),
+                        None if min_repl_adj is None else int(min_repl_adj),
+                        None if max_repl_adj is None else int(max_repl_adj),
+                        str(scaling_status),
+                        float(total_requests or 0.0),
+                    )
+                    if self._last_autoscaling_snapshots.get(key) == signature:
+                        continue
+
+                    # --- BEGIN NEW LOGGING BLOCK ---
+                    # Build a single JSON payload for readability and downstream parsing.
+                    # Timestamp in ISO8601 Zulu for easy grepping.
+                    ts_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+                    # Extract policy name (best-effort and tolerant of schema variations).
+                    policy_name = None
+                    try:
+                        if isinstance(autoscaling_config, dict):
+                            policy = autoscaling_config.get(
+                                "_policy"
+                            ) or autoscaling_config.get("policy")
+                            if isinstance(policy, dict):
+                                policy_name = policy.get("name")
+                        else:
+                            policy = getattr(autoscaling_config, "_policy", None)
+                            if isinstance(policy, dict):
+                                policy_name = policy.get("name")
+                            else:
+                                policy_name = getattr(policy, "name", None)
+                    except Exception:
+                        policy_name = None
+                    if not policy_name:
+                        policy_name = "default"
+
+                    # Metrics context & health (best-effort).
+                    look_back_period_s = None
+                    try:
+                        if isinstance(autoscaling_config, dict):
+                            look_back_period_s = autoscaling_config.get(
+                                "look_back_period_s"
+                            )
+                        else:
+                            look_back_period_s = getattr(
+                                autoscaling_config, "look_back_period_s", None
+                            )
+                    except Exception:
+                        look_back_period_s = None
+
+                    # Snapshot may optionally include queued_requests and last metrics age.
+                    queued_requests = snapshot.get("queued_requests")
+                    last_metrics_age_s = snapshot.get("last_metrics_age_s")
+
+                    # Derive a human-friendly metrics health string.
+                    metrics_health_value = getattr(
+                        AutoscalingMetricsHealth, "HEALTHY"
+                    ).value
+                    metrics_health_text = "ok"
+                    if last_metrics_age_s is not None:
+                        # Consider "delayed" if older than the look_back window or 3x a 10s default.
+                        threshold = look_back_period_s or 30.0
+                        if last_metrics_age_s > threshold:
+                            metrics_health_text = (
+                                f"delayed (last update {int(last_metrics_age_s)}s ago)"
+                            )
+
+                    # Summarize last few decisions to avoid very long logs.
+                    recent_decisions = self._scaling_decisions.get(dep_id, [])
+                    summarized = []
+                    for d in recent_decisions[-2:]:
+                        # Ensure we work with dict form regardless of object
+                        dd = (
+                            d.dict()
+                            if hasattr(d, "dict")
+                            else {
+                                "timestamp_s": getattr(d, "timestamp_s", None),
+                                "from_replicas": getattr(d, "from_replicas", None),
+                                "to_replicas": getattr(d, "to_replicas", None),
+                                "reason": getattr(d, "reason", ""),
+                            }
+                        )
+                        # ISO timestamp
+                        d_ts = time.strftime(
+                            "%Y-%m-%dT%H:%M:%SZ",
+                            time.gmtime(dd.get("timestamp_s") or time.time()),
+                        )
+                        # Shorten reason
+                        reason_short = dd.get("reason") or ""
+                        if len(reason_short) > 80:
+                            reason_short = reason_short[:77] + "..."
+                        summarized.append(
+                            {
+                                "ts": d_ts,
+                                "from": dd.get("from_replicas"),
+                                "to": dd.get("to_replicas"),
+                                "reason": reason_short,
+                            }
+                        )
+
+                    # Human-friendly scaling status
+                    scaling_status_h = {
+                        "UPSCALING": "scaling up",
+                        "DOWNSCALING": "scaling down",
+                        "STABLE": "stable",
+                    }.get(scaling_status, str(scaling_status).lower())
+
+                    payload = {
+                        "ts": ts_iso,
+                        "app": app_name,
+                        "deployment": dep_name,
+                        "current_replicas": int(current_replicas),
+                        "target_replicas": int(proposed_replicas),
+                        "replicas_allowed": {
+                            "min": (
+                                None if min_repl_adj is None else int(min_repl_adj)
+                            ),
+                            "max": (
+                                None if max_repl_adj is None else int(max_repl_adj)
+                            ),
+                        },
+                        "scaling_status": scaling_status_h,
+                        "policy": policy_name,  # e.g., Default (queue-length based)
+                        "metrics": {
+                            "look_back_period_s": look_back_period_s,
+                            "queued_requests": (
+                                None
+                                if queued_requests is None
+                                else float(queued_requests)
+                            ),
+                            "total_requests": float(total_requests or 0.0),
+                        },
+                        "metrics_health": metrics_health_text,
+                        "errors": snapshot.get("errors", []),
+                        "decisions": summarized,
+                    }
+
+                    logger.info(
+                        "serve_autoscaling_snapshot "
+                        + json.dumps(payload, separators=(",", ":"))
+                    )
+
+                    self._last_autoscaling_snapshots[key] = signature
+        except Exception:
+            # Never let logging issues impact the control loop.
+            logger.exception("Failed emitting autoscaling snapshot.")
+
     async def run_control_loop(self) -> None:
         # NOTE(edoakes): we catch all exceptions here and simply log them,
         # because an unhandled exception would cause the main control loop to
@@ -462,6 +679,9 @@ class ServeController:
             self.asm_update_duration_gauge_s.set(time.time() - asm_update_start_time)
         except Exception:
             logger.exception("Exception updating application state.")
+
+        # Emit one autoscaling snapshot per deployment per loop using existing state.
+        self._emit_deployment_autoscaling_snapshots()
 
         # Update the proxy nodes set before updating the proxy states,
         # so they are more consistent.
