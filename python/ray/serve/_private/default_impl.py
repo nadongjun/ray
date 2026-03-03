@@ -51,8 +51,10 @@ from ray.util.placement_group import PlacementGroup
 # API modified w/o substantial enough justification
 
 
-def create_cluster_node_info_cache(gcs_client: GcsClient) -> ClusterNodeInfoCache:
-    return DefaultClusterNodeInfoCache(gcs_client)
+def create_cluster_node_info_cache(
+    gcs_client: GcsClient, kv_store=None
+) -> ClusterNodeInfoCache:
+    return DefaultClusterNodeInfoCache(gcs_client, kv_store=kv_store)
 
 
 CreatePlacementGroupFn = Callable[[CreatePlacementGroupRequest], PlacementGroup]

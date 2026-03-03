@@ -1,3 +1,4 @@
+import json
 import logging
 from abc import ABC, abstractmethod
 from typing import Dict, FrozenSet, List, Optional, Set, Tuple, Union
@@ -9,14 +10,18 @@ from ray.serve._private.constants import RAY_GCS_RPC_TIMEOUT_S, SERVE_LOGGER_NAM
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
 
+CUSTOM_NODE_LABELS_KV_PREFIX = "node-labels-"
+
 
 class ClusterNodeInfoCache(ABC):
     """Provide access to cached node information in the cluster."""
 
-    def __init__(self, gcs_client: GcsClient):
+    def __init__(self, gcs_client: GcsClient, kv_store=None):
         self._gcs_client = gcs_client
+        self._kv_store = kv_store
         self._cached_alive_nodes = None
         self._cached_node_labels = dict()
+        self._custom_node_labels: Dict[str, Dict[str, str]] = dict()
         self._cached_total_resources_per_node = dict()
         self._cached_available_resources_per_node = dict()
         # Track alive node IDs to detect cluster membership changes and skip
@@ -58,6 +63,11 @@ class ClusterNodeInfoCache(ABC):
                 for (node_id, node) in nodes.items()
                 if node_id.hex() in current_alive_ids
             }
+
+        # Reload custom labels from KV store for alive nodes.
+        # This ensures labels survive controller restarts.
+        if self._kv_store is not None:
+            self._reload_custom_labels_from_kv(current_alive_ids)
 
         # Fetch available resources using the existing GCS client rather than
         # the legacy GlobalStateAccessor path (which opens a second connection
@@ -129,13 +139,102 @@ class ClusterNodeInfoCache(ABC):
         return self._cached_available_resources_per_node
 
     def get_node_labels(self, node_id: str) -> Dict[str, str]:
-        """Get the labels for a specific node from the cache."""
-        return self._cached_node_labels.get(node_id, {})
+        """Get the labels for a specific node from the cache.
+
+        Returns GCS labels merged with any custom labels set via
+        set_node_labels(). Custom labels take precedence.
+        """
+        labels = self._cached_node_labels.get(node_id, {}).copy()
+        custom = self._custom_node_labels.get(node_id)
+        if custom:
+            labels.update(custom)
+        return labels
+
+    def get_all_node_labels(self) -> Dict[str, Dict[str, str]]:
+        """Get merged labels for all alive nodes."""
+        return {
+            node_id: self.get_node_labels(node_id)
+            for node_id in self._alive_node_id_set
+        }
+
+    def set_node_labels(self, node_id: str, labels: Dict[str, str]) -> None:
+        """Dynamically set custom labels for a node.
+
+        Labels are persisted in KV store (if available) so they survive
+        controller restarts. Custom labels are merged on top of GCS labels.
+        """
+        self._custom_node_labels[node_id] = labels.copy()
+        if self._kv_store is not None:
+            try:
+                key = f"{CUSTOM_NODE_LABELS_KV_PREFIX}{node_id}"
+                self._kv_store.put(key, json.dumps(labels).encode())
+            except Exception:
+                logger.warning(
+                    f"Failed to persist custom labels for node {node_id} "
+                    "to KV store.",
+                    exc_info=True,
+                )
+
+    def patch_node_labels(self, node_id: str, labels: Dict[str, str]) -> None:
+        """Add or update specific custom labels for a node.
+
+        Unlike set_node_labels which replaces all custom labels,
+        this merges the given labels into existing custom labels.
+        """
+        existing = self._custom_node_labels.get(node_id, {}).copy()
+        existing.update(labels)
+        self._custom_node_labels[node_id] = existing
+        if self._kv_store is not None:
+            try:
+                key = f"{CUSTOM_NODE_LABELS_KV_PREFIX}{node_id}"
+                self._kv_store.put(key, json.dumps(existing).encode())
+            except Exception:
+                logger.warning(
+                    f"Failed to persist custom labels for node {node_id} "
+                    "to KV store.",
+                    exc_info=True,
+                )
+
+    def delete_node_label(self, node_id: str, label_key: str) -> None:
+        """Delete a specific custom label key for a node.
+
+        If the key doesn't exist in custom labels, this is a no-op (idempotent).
+        """
+        custom = self._custom_node_labels.get(node_id, {})
+        custom.pop(label_key, None)
+        self._custom_node_labels[node_id] = custom
+        if self._kv_store is not None:
+            try:
+                key = f"{CUSTOM_NODE_LABELS_KV_PREFIX}{node_id}"
+                self._kv_store.put(key, json.dumps(custom).encode())
+            except Exception:
+                logger.warning(
+                    f"Failed to persist custom labels for node {node_id} "
+                    "to KV store.",
+                    exc_info=True,
+                )
+
+    def _reload_custom_labels_from_kv(self, alive_node_ids: FrozenSet[str]) -> None:
+        """Reload custom labels from KV store for alive nodes."""
+        reloaded = {}
+        for node_id in alive_node_ids:
+            try:
+                key = f"{CUSTOM_NODE_LABELS_KV_PREFIX}{node_id}"
+                val = self._kv_store.get(key)
+                if val is not None:
+                    reloaded[node_id] = json.loads(val.decode())
+            except Exception:
+                logger.debug(
+                    f"Failed to load custom labels for node {node_id} "
+                    "from KV store.",
+                    exc_info=True,
+                )
+        self._custom_node_labels = reloaded
 
 
 class DefaultClusterNodeInfoCache(ClusterNodeInfoCache):
-    def __init__(self, gcs_client: GcsClient):
-        super().__init__(gcs_client)
+    def __init__(self, gcs_client: GcsClient, kv_store=None):
+        super().__init__(gcs_client, kv_store=kv_store)
 
     def get_draining_nodes(self) -> Dict[str, int]:
         return dict()

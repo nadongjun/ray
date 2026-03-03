@@ -273,6 +273,180 @@ class ServeHead(SubprocessModule):
                     {"error": "Internal Server Error"}, 503
                 )
 
+    @routes.get("/api/v1/nodes/labels")
+    @dashboard_optional_utils.init_ray_and_catch_exceptions()
+    @validate_endpoint()
+    async def get_all_node_labels(self, req: Request) -> Response:
+        """Get merged labels (GCS + custom) for all alive nodes."""
+        controller = await self.get_serve_controller()
+        if controller is None:
+            return self._create_json_response(
+                {"error": "Serve controller is not available"}, 503
+            )
+
+        try:
+            all_labels = await controller.get_all_node_labels.remote()
+            return self._create_json_response(all_labels, 200)
+        except ray.exceptions.RayTaskError as e:
+            return self._create_json_response(
+                {"error": f"Failed to get node labels: {e}"}, 503
+            )
+
+    @routes.get("/api/v1/nodes/{node_id}/labels")
+    @dashboard_optional_utils.init_ray_and_catch_exceptions()
+    @validate_endpoint()
+    async def get_node_labels(self, req: Request) -> Response:
+        """Get merged labels (GCS + custom) for a specific node."""
+        node_id = req.match_info.get("node_id")
+        if not node_id:
+            return self._create_json_response({"error": "Missing node_id in path"}, 400)
+
+        controller = await self.get_serve_controller()
+        if controller is None:
+            return self._create_json_response(
+                {"error": "Serve controller is not available"}, 503
+            )
+
+        try:
+            labels = await controller.get_node_labels.remote(node_id)
+            return self._create_json_response(labels, 200)
+        except ray.exceptions.RayTaskError as e:
+            return self._create_json_response(
+                {"error": f"Failed to get node labels: {e}"}, 503
+            )
+
+    @routes.put("/api/v1/nodes/{node_id}/labels")
+    @dashboard_optional_utils.init_ray_and_catch_exceptions()
+    @validate_endpoint()
+    async def set_node_labels(self, req: Request) -> Response:
+        """Set custom labels for a specific node.
+
+        Request body: {"labels": {"key1": "value1", "key2": "value2"}}
+        """
+        node_id = req.match_info.get("node_id")
+        if not node_id:
+            return self._create_json_response({"error": "Missing node_id in path"}, 400)
+
+        try:
+            request_data = await req.json()
+        except Exception as e:
+            return self._create_json_response(
+                {"error": f"Invalid request body: {str(e)}"}, 400
+            )
+
+        labels = request_data.get("labels")
+        if labels is None or not isinstance(labels, dict):
+            return self._create_json_response(
+                {"error": "'labels' field is required and must be a dict"}, 400
+            )
+
+        # Validate all keys and values are strings
+        for k, v in labels.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                return self._create_json_response(
+                    {"error": "All label keys and values must be strings"}, 400
+                )
+
+        controller = await self.get_serve_controller()
+        if controller is None:
+            return self._create_json_response(
+                {"error": "Serve controller is not available"}, 503
+            )
+
+        try:
+            await controller.set_node_labels.remote(node_id, labels)
+            return self._create_json_response(
+                {"message": f"Labels updated for node {node_id}"}, 200
+            )
+        except ray.exceptions.RayTaskError as e:
+            return self._create_json_response(
+                {"error": f"Failed to set node labels: {e}"}, 503
+            )
+
+    @routes.patch("/api/v1/nodes/{node_id}/labels")
+    @dashboard_optional_utils.init_ray_and_catch_exceptions()
+    @validate_endpoint()
+    async def patch_node_labels(self, req: Request) -> Response:
+        """Add or update specific custom labels for a node.
+
+        Unlike PUT which replaces all custom labels, PATCH merges
+        the given labels into existing custom labels.
+
+        Request body: {"labels": {"key1": "value1"}}
+        """
+        node_id = req.match_info.get("node_id")
+        if not node_id:
+            return self._create_json_response({"error": "Missing node_id in path"}, 400)
+
+        try:
+            request_data = await req.json()
+        except Exception as e:
+            return self._create_json_response(
+                {"error": f"Invalid request body: {str(e)}"}, 400
+            )
+
+        labels = request_data.get("labels")
+        if labels is None or not isinstance(labels, dict):
+            return self._create_json_response(
+                {"error": "'labels' field is required and must be a dict"}, 400
+            )
+
+        for k, v in labels.items():
+            if not isinstance(k, str) or not isinstance(v, str):
+                return self._create_json_response(
+                    {"error": "All label keys and values must be strings"}, 400
+                )
+
+        controller = await self.get_serve_controller()
+        if controller is None:
+            return self._create_json_response(
+                {"error": "Serve controller is not available"}, 503
+            )
+
+        try:
+            await controller.patch_node_labels.remote(node_id, labels)
+            return self._create_json_response(
+                {"message": f"Labels patched for node {node_id}"}, 200
+            )
+        except ray.exceptions.RayTaskError as e:
+            return self._create_json_response(
+                {"error": f"Failed to patch node labels: {e}"}, 503
+            )
+
+    @routes.delete("/api/v1/nodes/{node_id}/labels/{label_key}")
+    @dashboard_optional_utils.init_ray_and_catch_exceptions()
+    @validate_endpoint()
+    async def delete_node_label(self, req: Request) -> Response:
+        """Delete a specific custom label key for a node.
+
+        Idempotent: returns 200 even if the key doesn't exist.
+        """
+        node_id = req.match_info.get("node_id")
+        label_key = req.match_info.get("label_key")
+        if not node_id:
+            return self._create_json_response({"error": "Missing node_id in path"}, 400)
+        if not label_key:
+            return self._create_json_response(
+                {"error": "Missing label_key in path"}, 400
+            )
+
+        controller = await self.get_serve_controller()
+        if controller is None:
+            return self._create_json_response(
+                {"error": "Serve controller is not available"}, 503
+            )
+
+        try:
+            await controller.delete_node_label.remote(node_id, label_key)
+            return self._create_json_response(
+                {"message": (f"Label '{label_key}' deleted for node {node_id}")},
+                200,
+            )
+        except ray.exceptions.RayTaskError as e:
+            return self._create_json_response(
+                {"error": f"Failed to delete node label: {e}"}, 503
+            )
+
     def validate_http_options(self, client, http_options):
         divergent_http_options = []
 

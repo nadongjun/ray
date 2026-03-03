@@ -634,6 +634,14 @@ class DeploymentScheduler(ABC):
             target_node_id = None
 
         actor_options = copy.deepcopy(scheduling_request.actor_options)
+        # When Serve's Python scheduler has resolved the target node
+        # (via NodeAffinitySchedulingStrategy), remove label_selector and
+        # fallback_strategy from actor_options. Otherwise C++ raylet
+        # re-checks against GCS labels which don't include custom labels
+        # set via the dynamic label API.
+        if target_node_id is not None:
+            actor_options.pop("label_selector", None)
+            actor_options.pop("fallback_strategy", None)
         if scheduling_request.max_replicas_per_node is not None:
             if "resources" not in actor_options:
                 actor_options["resources"] = {}
@@ -943,17 +951,71 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
                     scheduling_request.replica_id
                 )
 
+    def _find_matching_node_for_labels(
+        self,
+        scheduling_request: ReplicaSchedulingRequest,
+        label_selector: Dict[str, str],
+        all_node_labels: Dict[str, Dict[str, str]],
+    ) -> Optional[str]:
+        """Find a node whose merged labels match the selector.
+
+        Also checks fallback_strategy if primary selector doesn't match.
+        Returns the node_id or None.
+        """
+        from ray._raylet import node_labels_match_selector
+
+        # Try primary label_selector
+        for node_id, labels in all_node_labels.items():
+            if node_labels_match_selector(labels, label_selector):
+                return node_id
+
+        # Try fallback strategies
+        fallback_strategy = scheduling_request.actor_options.get("fallback_strategy")
+        if fallback_strategy:
+            for fallback in fallback_strategy:
+                fallback_labels = fallback.get("label_selector", {})
+                if fallback_labels:
+                    for node_id, labels in all_node_labels.items():
+                        if node_labels_match_selector(labels, fallback_labels):
+                            return node_id
+
+        return None
+
     def _schedule_with_spread_strategy(self):
         """Tries to schedule pending replicas using the SPREAD strategy."""
+        # Fetch node labels for active nodes to support dynamic custom labels.
+        active_nodes = self._cluster_node_info_cache.get_active_node_ids()
+        all_node_labels = {
+            node_id: self._cluster_node_info_cache.get_node_labels(node_id)
+            for node_id in active_nodes
+        }
+
         for pending_replicas in self._pending_replicas.values():
             if not pending_replicas:
                 continue
 
             for scheduling_request in list(pending_replicas.values()):
-                self._schedule_replica(
-                    scheduling_request=scheduling_request,
-                    default_scheduling_strategy="SPREAD",
-                )
+                # If the request has label constraints, find a matching node
+                # using Serve's merged labels (GCS + custom) instead of
+                # letting C++ raylet check only GCS labels.
+                label_selector = scheduling_request.actor_options.get("label_selector")
+                if label_selector:
+                    target_node = self._find_matching_node_for_labels(
+                        scheduling_request, label_selector, all_node_labels
+                    )
+                    if target_node is None:
+                        # No matching node — skip and retry next cycle.
+                        continue
+                    self._schedule_replica(
+                        scheduling_request=scheduling_request,
+                        default_scheduling_strategy="SPREAD",
+                        target_node_id=target_node,
+                    )
+                else:
+                    self._schedule_replica(
+                        scheduling_request=scheduling_request,
+                        default_scheduling_strategy="SPREAD",
+                    )
 
     def _pack_schedule_replica(
         self,
@@ -978,6 +1040,8 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
 
         placement_candidates = self._build_pack_placement_candidates(scheduling_request)
 
+        has_label_constraints = any(labels for _, labels in placement_candidates)
+
         target_node = None
         for required_resources, required_labels in placement_candidates:
             target_node = self._find_best_fit_node_for_pack(
@@ -989,6 +1053,11 @@ class DefaultDeploymentScheduler(DeploymentScheduler):
             )
             if target_node:
                 break
+
+        # If label constraints exist but no matching node was found,
+        # do not schedule — wait until a matching node becomes available.
+        if target_node is None and has_label_constraints:
+            return None
 
         succeeded = self._schedule_replica(
             scheduling_request,

@@ -189,7 +189,9 @@ class ServeController:
             call_function_from_import_path(RAY_SERVE_CONTROLLER_CALLBACK_IMPORT_PATH)
 
         # Used to read/write checkpoints.
-        self.cluster_node_info_cache = create_cluster_node_info_cache(self.gcs_client)
+        self.cluster_node_info_cache = create_cluster_node_info_cache(
+            self.gcs_client, kv_store=self.kv_store
+        )
         self.cluster_node_info_cache.update()
 
         self._ha_proxy_enabled = RAY_SERVE_ENABLE_HA_PROXY
@@ -1753,6 +1755,58 @@ class ServeController:
             Dictionary mapping replica_id to ReplicaRank object (with rank, node_rank, local_rank).
         """
         return self.deployment_state_manager._get_replica_ranks_mapping(deployment_id)
+
+    def set_node_labels(self, node_id: str, labels: Dict[str, str]) -> None:
+        """Dynamically set custom labels for a node.
+
+        Custom labels are persisted in KV store and merged on top of
+        GCS labels for Serve scheduling purposes.
+
+        Args:
+            node_id: The hex ID of the node to set labels for.
+            labels: Dictionary of label key-value pairs.
+        """
+        self.cluster_node_info_cache.set_node_labels(node_id, labels)
+
+    def get_node_labels(self, node_id: str) -> Dict[str, str]:
+        """Get the merged labels (GCS + custom) for a specific node.
+
+        Args:
+            node_id: The hex ID of the node.
+
+        Returns:
+            Dictionary of label key-value pairs.
+        """
+        return self.cluster_node_info_cache.get_node_labels(node_id)
+
+    def patch_node_labels(self, node_id: str, labels: Dict[str, str]) -> None:
+        """Add or update specific custom labels for a node.
+
+        Unlike set_node_labels which replaces all custom labels,
+        this merges the given labels into existing custom labels.
+
+        Args:
+            node_id: The hex ID of the node.
+            labels: Dictionary of labels to add or update.
+        """
+        self.cluster_node_info_cache.patch_node_labels(node_id, labels)
+
+    def delete_node_label(self, node_id: str, label_key: str) -> None:
+        """Delete a specific custom label key for a node.
+
+        Args:
+            node_id: The hex ID of the node.
+            label_key: The label key to delete.
+        """
+        self.cluster_node_info_cache.delete_node_label(node_id, label_key)
+
+    def get_all_node_labels(self) -> Dict[str, Dict[str, str]]:
+        """Get merged labels for all alive nodes.
+
+        Returns:
+            Dictionary mapping node_id to its label dict.
+        """
+        return self.cluster_node_info_cache.get_all_node_labels()
 
     async def graceful_shutdown(self, wait: bool = True):
         """Set the shutting down flag on controller to signal shutdown in
