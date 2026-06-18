@@ -110,7 +110,7 @@ class RedisContext;
 struct RedisRequestContext {
   RedisRequestContext(instrumented_io_context &io_service,
                       RedisCallback callback,
-                      RedisAsyncContext *context,
+                      std::shared_ptr<RedisAsyncContext> context,
                       std::vector<std::string> args,
                       ClockInterface &clock);
 
@@ -123,7 +123,7 @@ struct RedisRequestContext {
  private:
   ExponentialBackoff exp_back_off_;
   instrumented_io_context &io_service_;
-  RedisAsyncContext *redis_context_;
+  std::shared_ptr<RedisAsyncContext> redis_context_;
   size_t pending_retries_;
   RedisCallback callback_;
   absl::Time start_time_;
@@ -197,7 +197,7 @@ class RedisContext {
 
   std::unique_ptr<redisContext, RedisContextDeleter> context_;
   redisSSLContext *ssl_context_;
-  std::unique_ptr<RedisAsyncContext> redis_async_context_;
+  std::shared_ptr<RedisAsyncContext> redis_async_context_;
   int64_t redis_db_probe_timeout_milliseconds_;
 };
 

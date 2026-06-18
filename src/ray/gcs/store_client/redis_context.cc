@@ -156,14 +156,14 @@ const std::vector<std::optional<std::string>> &CallbackReply::ReadAsStringArray(
 
 RedisRequestContext::RedisRequestContext(instrumented_io_context &io_service,
                                          RedisCallback callback,
-                                         RedisAsyncContext *context,
+                                         std::shared_ptr<RedisAsyncContext> context,
                                          std::vector<std::string> args,
                                          ClockInterface &clock)
     : exp_back_off_(RayConfig::instance().redis_retry_base_ms(),
                     RayConfig::instance().redis_retry_multiplier(),
                     RayConfig::instance().redis_retry_max_ms()),
       io_service_(io_service),
-      redis_context_(context),
+      redis_context_(std::move(context)),
       pending_retries_(RayConfig::instance().num_redis_request_retries() + 1),
       callback_(std::move(callback)),
       start_time_(clock.Now()),
@@ -184,7 +184,9 @@ void RedisRequestContext::RedisResponseFn(redisAsyncContext *async_context,
   auto redis_reply = reinterpret_cast<redisReply *>(raw_reply);
   // Error happened.
   if (redis_reply == nullptr || redis_reply->type == REDIS_REPLY_ERROR) {
-    auto error_msg = redis_reply ? redis_reply->str : async_context->errstr;
+    auto error_msg = redis_reply ? redis_reply->str
+                                 : (async_context ? async_context->errstr
+                                                  : "Redis connection unavailable");
     RAY_LOG(ERROR) << "Redis request [" << absl::StrJoin(request_cxt->redis_cmds_, " ")
                    << "]"
                    << " failed due to error " << error_msg << ". "
@@ -742,7 +744,7 @@ void RedisContext::RunArgvAsync(std::vector<std::string> args,
   RAY_CHECK(redis_async_context_);
   auto request_context = new RedisRequestContext(io_service_,
                                                  std::move(redis_callback),
-                                                 redis_async_context_.get(),
+                                                 redis_async_context_,
                                                  std::move(args),
                                                  clock_);
   // RedisRequestContext is thread safe.
