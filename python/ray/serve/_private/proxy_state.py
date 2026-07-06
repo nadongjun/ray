@@ -284,7 +284,10 @@ class ActorProxyWrapper(ProxyWrapper):
     def is_shutdown(self) -> bool:
         """Return whether the proxy actor is shutdown.
 
-        If the actor is dead, the health check will return RayActorError.
+        If the actor is dead, the health check raises RayActorError. If the
+        actor is permanently unschedulable (e.g. hard-pinned to a node that no
+        longer exists), it raises ActorUnschedulableError. Both cases mean the
+        actor is ready for shutdown.
         """
         try:
             ray.get(self._actor_handle.check_health.remote(), timeout=0)
