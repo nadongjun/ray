@@ -267,13 +267,6 @@ async def test_is_drained_check_timeout():
     assert proxy_wrapper.is_drained(timeout_s=0) is False
 
 
-@pytest.fixture
-def ray_instance():
-    ray.init(num_cpus=2)
-    yield
-    ray.shutdown()
-
-
 def _make_unschedulable_wrapper(name: str) -> ActorProxyWrapper:
     """Create an ActorProxyWrapper around a real proxy pinned to a removed node.
 
@@ -299,7 +292,7 @@ def _make_unschedulable_wrapper(name: str) -> ActorProxyWrapper:
     )
 
 
-def test_is_shutdown_true_when_actor_unschedulable(ray_instance):
+def test_is_shutdown_true_when_actor_unschedulable(ray_shutdown):
     """End-to-end regression test for the proxy update loop hang.
 
     A proxy actor hard-pinned to a removed node becomes permanently
@@ -315,17 +308,19 @@ def test_is_shutdown_true_when_actor_unschedulable(ray_instance):
     once the scheduler gives up. ``is_shutdown()`` must converge to ``True``
     without ever raising.
     """
+    ray.init(num_cpus=2)
     wrapper = _make_unschedulable_wrapper(name="test_is_shutdown_unschedulable")
     wait_for_condition(wrapper.is_shutdown, timeout=30)
 
 
-def test_kill_does_not_raise_when_actor_unschedulable(ray_instance):
+def test_kill_does_not_raise_when_actor_unschedulable(ray_shutdown):
     """``kill`` calls ``is_shutdown`` first; on an unschedulable proxy it must
     short-circuit and return instead of propagating the exception.
 
     This is the exact call chain (``kill`` -> ``is_shutdown``) that hung the
     controller loop, so ``kill()`` must complete without raising.
     """
+    ray.init(num_cpus=2)
     wrapper = _make_unschedulable_wrapper(name="test_kill_unschedulable")
     # Wait until the actor is actually unschedulable, then kill() is a no-op.
     wait_for_condition(wrapper.is_shutdown, timeout=30)
