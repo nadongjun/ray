@@ -35,6 +35,7 @@ from ray.serve._private.common import (
 from ray.serve._private.config import DeploymentConfig
 from ray.serve._private.constants import (
     CONTROL_LOOP_INTERVAL_S,
+    DEFAULT_LATENCY_BUCKET_MS,
     RAY_SERVE_CONTROLLER_CALLBACK_IMPORT_PATH,
     RAY_SERVE_ENABLE_DIRECT_INGRESS,
     RAY_SERVE_ENABLE_HA_PROXY,
@@ -114,6 +115,7 @@ from ray.serve.schema import (
 from ray.util import metrics
 
 logger = logging.getLogger(SERVE_LOGGER_NAME)
+
 
 # Used for testing purposes only. If this is set, the controller will crash
 # after writing each checkpoint with the specified probability.
@@ -386,13 +388,17 @@ class ServeController:
             replica_metric_report = decompress_metric_report(replica_metric_report)
         latency = time.time() - replica_metric_report.timestamp
         latency_ms = latency * 1000
-        # Record the metrics delay for observability
-        self.replica_metrics_delay_gauge.set(
+        deployment = replica_metric_report.replica_id.deployment_id.name
+        application = replica_metric_report.replica_id.deployment_id.app_name
+
+        # Record the metrics delay for observability. A histogram lets Prometheus
+        # aggregate reports from all replicas of a deployment, so we omit the
+        # per-replica tag to keep cardinality bounded.
+        self.replica_metrics_delay_histogram.observe(
             latency_ms,
             tags={
-                "deployment": replica_metric_report.replica_id.deployment_id.name,
-                "application": replica_metric_report.replica_id.deployment_id.app_name,
-                "replica": replica_metric_report.replica_id.unique_id,
+                "deployment": deployment,
+                "application": application,
             },
         )
         # Track in health metrics
@@ -408,13 +414,17 @@ class ServeController:
             handle_metric_report = decompress_metric_report(handle_metric_report)
         latency = time.time() - handle_metric_report.timestamp
         latency_ms = latency * 1000
-        # Record the metrics delay for observability
-        self.handle_metrics_delay_gauge.set(
+        deployment = handle_metric_report.deployment_id.name
+        application = handle_metric_report.deployment_id.app_name
+
+        # Record the metrics delay for observability. A histogram lets Prometheus
+        # aggregate reports from all handles of a deployment, so we omit the
+        # per-handle tag to keep cardinality bounded.
+        self.handle_metrics_delay_histogram.observe(
             latency_ms,
             tags={
-                "deployment": handle_metric_report.deployment_id.name,
-                "application": handle_metric_report.deployment_id.app_name,
-                "handle": handle_metric_report.handle_id,
+                "deployment": deployment,
+                "application": application,
             },
         )
         # Track in health metrics
@@ -776,21 +786,23 @@ class ServeController:
         )
 
         # Autoscaling metrics delay gauges
-        self.replica_metrics_delay_gauge = metrics.Gauge(
+        self.replica_metrics_delay_histogram = metrics.Histogram(
             "serve_autoscaling_replica_metrics_delay_ms",
             description=(
                 "Time taken for the replica metrics to be reported to the controller. "
                 "High values may indicate a busy controller."
             ),
-            tag_keys=("deployment", "application", "replica"),
+            boundaries=DEFAULT_LATENCY_BUCKET_MS,
+            tag_keys=("deployment", "application"),
         )
-        self.handle_metrics_delay_gauge = metrics.Gauge(
+        self.handle_metrics_delay_histogram = metrics.Histogram(
             "serve_autoscaling_handle_metrics_delay_ms",
             description=(
                 "Time taken for the handle metrics to be reported to the controller. "
                 "High values may indicate a busy controller."
             ),
-            tag_keys=("deployment", "application", "handle"),
+            boundaries=DEFAULT_LATENCY_BUCKET_MS,
+            tag_keys=("deployment", "application"),
         )
         self.async_inference_task_queue_metrics_delay_gauge = metrics.Gauge(
             "serve_autoscaling_async_inference_task_queue_metrics_delay_ms",
@@ -1112,6 +1124,7 @@ class ServeController:
                         "deployer_job_id": args.deployer_job_id,
                         "ingress": args.ingress,
                         "ingress_request_router": args.ingress_request_router,
+                        "uses_multiplexing": args.uses_multiplexing,
                         "route_prefix": (
                             args.route_prefix if args.HasField("route_prefix") else None
                         ),
@@ -1409,6 +1422,7 @@ class ServeController:
                     targets=self.proxy_state_manager.get_targets(RequestProtocol.HTTP),
                     app_name="",
                     ingress_request_router_targets=[],
+                    ingress_deployment_name="",
                 )
             )
             if is_grpc_enabled(self.get_grpc_config()):
@@ -1421,6 +1435,7 @@ class ServeController:
                         ),
                         app_name="",
                         ingress_request_router_targets=[],
+                        ingress_deployment_name="",
                     )
                 )
         return target_groups
@@ -1554,6 +1569,11 @@ class ServeController:
                 app_name
             )
         )
+        # Ingress deployment name, threaded into the target groups so HAProxy can
+        # tag per-request ingress metrics with it (matching the Python proxy).
+        ingress_deployment_name = (
+            self.application_state_manager.get_ingress_deployment_name(app_name) or ""
+        )
 
         # Get running replicas for the ingress deployment
         replica_details = self._get_running_replica_details_for_ingress_deployment(
@@ -1587,6 +1607,7 @@ class ServeController:
                     targets=http_targets,
                     app_name=app_name,
                     ingress_request_router_targets=ingress_request_router_targets,
+                    ingress_deployment_name=ingress_deployment_name,
                 )
             )
 
@@ -1603,6 +1624,7 @@ class ServeController:
                         targets=grpc_targets,
                         app_name=app_name,
                         ingress_request_router_targets=[],
+                        ingress_deployment_name=ingress_deployment_name,
                     )
                 )
 
@@ -1616,6 +1638,12 @@ class ServeController:
         for proxy. This will allow applications to be discoverable via the
         proxy in situations where their replicas have scaled down to 0.
         """
+        # Ingress deployment name, threaded into the target groups so HAProxy can
+        # tag per-request ingress metrics with it (matching the Python proxy).
+        ingress_deployment_name = (
+            self.application_state_manager.get_ingress_deployment_name(app_name) or ""
+        )
+
         if self._ha_proxy_enabled:
             http_targets = []
             grpc_targets = []
@@ -1636,6 +1664,7 @@ class ServeController:
                     targets=http_targets,
                     app_name=app_name,
                     ingress_request_router_targets=[],
+                    ingress_deployment_name=ingress_deployment_name,
                 )
             )
         if include_grpc:
@@ -1646,6 +1675,7 @@ class ServeController:
                     targets=grpc_targets,
                     app_name=app_name,
                     ingress_request_router_targets=[],
+                    ingress_deployment_name=ingress_deployment_name,
                 )
             )
 
