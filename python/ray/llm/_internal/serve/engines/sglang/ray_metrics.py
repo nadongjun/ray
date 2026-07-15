@@ -6,7 +6,7 @@ Ray Serve LLM injects SGLang's Ray metric backend
 into the engine through the ``ServerArgs.stat_loggers`` dependency-injection
 map. The engine's metrics collectors then emit directly through
 ``ray.util.metrics``, so SGLang engine metrics appear on Ray's Prometheus
-endpoint and dashboard with Ray Serve's replica tags attached — the same
+endpoint and dashboard with Ray Serve's replica tags attached, the same
 one-flag experience as the vLLM backend's ``RayPrometheusStatLogger``.
 
 Process topology caveat: SGLang runs its scheduler and detokenizer in

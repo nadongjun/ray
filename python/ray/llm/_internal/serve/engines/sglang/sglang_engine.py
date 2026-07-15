@@ -97,8 +97,9 @@ class SGLangServer:
         self._sleeping_tags: set[str] = set()
 
         # Route SGLang's engine metrics through ray.util.metrics via SGLang's
-        # ServerArgs.stat_loggers DI map (requires sglang >= 0.5.15), mirroring
-        # the vLLM backend's RayPrometheusStatLogger integration. Inject into a
+        # ServerArgs.stat_loggers DI map, mirroring the vLLM backend's
+        # RayPrometheusStatLogger integration. Needs sglang >= 0.5.15; older
+        # versions log a warning and serve without engine metrics. Inject into a
         # copy: stat_loggers holds class objects, which must not leak into
         # llm_config.engine_kwargs where a later JSON dump would choke on them.
         if self._llm_config.log_engine_metrics:
