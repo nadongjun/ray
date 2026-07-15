@@ -59,6 +59,7 @@ from ray.serve._private.test_utils import (
     MockPlacementGroup,
     dead_replicas_context,
     replica_rank_context,
+    uninitialized_replicas_context,
 )
 from ray.serve._private.utils import (
     get_capacity_adjusted_num_replicas,
@@ -245,6 +246,23 @@ class TestReplicaStateContainer:
         assert c.get_by_id(r1.replica_id) is None
         assert c.get_by_id(r3.replica_id) is None
 
+    def test_get_by_id_after_remove(self):
+        c = ReplicaStateContainer()
+        r1, r2, r3 = replica(), replica(), replica()
+        c.add(ReplicaState.STARTING, r1)
+        c.add(ReplicaState.RUNNING, r2)
+        c.add(ReplicaState.STOPPING, r3)
+
+        # remove() must clear the id index (like pop()) so get_by_id no longer
+        # returns removed replicas and the index does not leak entries.
+        removed = c.remove({r2.replica_id})
+        assert removed == [r2]
+        assert c.get_by_id(r2.replica_id) is None
+        assert r2.replica_id not in c._replica_id_index
+        # Untouched replicas are still retrievable.
+        assert c.get_by_id(r1.replica_id) is r1
+        assert c.get_by_id(r3.replica_id) is r3
+
     def test_pop_basic(self):
         c = ReplicaStateContainer()
         r1, r2, r3 = replica(), replica(), replica()
@@ -387,6 +405,16 @@ class TestDeploymentActorContainer:
         assert c.count(code_version="v1") == 2
         assert c.count(code_version="v2") == 1
         assert c.count(code_version="v3") == 0
+
+    def test_is_empty(self):
+        dep_id = DeploymentID(name="test", app_name="app")
+        c = DeploymentActorContainer(dep_id)
+        assert c.is_empty()
+        w = _mock_deployment_actor_wrapper(dep_id, "v1", "actor_a")
+        c.add(DeploymentActorState.STARTING, w)
+        assert not c.is_empty()
+        c.pop()  # remove all tracked actors
+        assert c.is_empty()
 
     def test_add_moves_existing(self):
         """Adding same (code_version, name) moves from old state to new."""
@@ -951,6 +979,70 @@ def test_create_delete_single_replica(mock_deployment_state_manager):
     replica._actor.set_done_stopping()
     dsm.update()
     check_counts(ds, total=0)
+
+
+@pytest.mark.parametrize(
+    "allocate_logs, expected_dead",
+    [(True, 1), (False, 0)],
+    ids=["with_logs", "no_logs"],
+)
+def test_recent_dead_replicas_retention(
+    mock_deployment_state_manager, allocate_logs, expected_dead
+):
+    """A stopped replica is retained for the dashboard iff it allocated a log file."""
+    create_dsm, _, _, _ = mock_deployment_state_manager
+    dsm: DeploymentStateManager = create_dsm()
+    dsm.deploy(TEST_DEPLOYMENT_ID, deployment_info()[0])
+    ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+
+    dsm.update()
+    if allocate_logs:
+        # set_ready() allocates the replica's log file path.
+        ds._replicas.get()[0]._actor.set_ready()
+        dsm.update()
+    replica_id = ds._replicas.get()[0].replica_id.unique_id
+
+    ds.delete()
+    dsm.update()
+    ds._replicas.get()[0]._actor.set_done_stopping()
+    dsm.update()
+    check_counts(ds, total=0)
+
+    # Dead replicas are tracked separately, so the live list is unaffected.
+    assert ds.list_replica_details() == []
+    dead = ds.list_recent_dead_replicas()
+    assert len(dead) == expected_dead
+    if expected_dead:
+        assert dead[0].replica_id == replica_id
+        assert dead[0].state == ReplicaState.STOPPED
+        assert dead[0].log_file_path is not None
+
+
+@patch("ray.serve._private.deployment_state.RAY_SERVE_RETAINED_DEAD_REPLICAS", 2)
+def test_recent_dead_replicas_bounded(mock_deployment_state_manager):
+    """Only the most recent RAY_SERVE_RETAINED_DEAD_REPLICAS are retained."""
+    create_dsm, _, _, _ = mock_deployment_state_manager
+    dsm: DeploymentStateManager = create_dsm()
+    dsm.deploy(TEST_DEPLOYMENT_ID, deployment_info(num_replicas=3)[0])
+    ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+    assert ds._recent_dead_replicas.maxlen == 2
+
+    # Bring up 3 replicas, then stop all of them at once.
+    dsm.update()
+    for replica in ds._replicas.get():
+        replica._actor.set_ready()
+    dsm.update()
+    check_counts(ds, total=3, by_state=[(ReplicaState.RUNNING, 3, None)])
+
+    ds.delete()
+    dsm.update()
+    for replica in ds._replicas.get():
+        replica._actor.set_done_stopping()
+    dsm.update()
+    check_counts(ds, total=0)
+
+    # Buffer is capped at 2 even though three replicas have stopped.
+    assert len(ds._recent_dead_replicas) == 2
 
 
 def test_force_kill(mock_deployment_state_manager):
@@ -3891,6 +3983,76 @@ def test_recover_during_rolling_update(mock_deployment_state_manager):
     assert mocked_replica.replica_id != new_mocked_replica_version2.replica_id
 
 
+def test_actor_uninitialized_before_recover(mock_deployment_state_manager):
+    """Test replica actor was found alive but never finished initialization.
+
+    Mirrors the production scenario where the previous controller crashed
+    between actor creation and the first
+    `initialize_and_get_metadata(rank=...)` call. `recover()` is non-
+    blocking: the new controller fires `was_initialized` asynchronously,
+    `check_ready()` observes the False response in the reconcile loop,
+    kills the actor, and the reconciler replaces it with a fresh replica.
+    The controller-side deploy-failure counter must NOT be bumped, since
+    the underlying cause is a previous controller crash, not user code.
+    """
+
+    create_dsm, _, _, _ = mock_deployment_state_manager
+    dsm = create_dsm()
+
+    info1, v1 = deployment_info(version="1")
+    target_state_changed = dsm.deploy(TEST_DEPLOYMENT_ID, info1)
+    assert target_state_changed
+    dsm.save_checkpoint()
+    ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+
+    dsm.update()
+    check_counts(ds, total=1, by_state=[(ReplicaState.STARTING, 1, v1)])
+    mocked_replica = ds._replicas.get()[0]
+    replica_id = mocked_replica.replica_id
+
+    mocked_replica._actor.set_ready()
+    dsm.update()
+    check_counts(ds, total=1, by_state=[(ReplicaState.RUNNING, 1, v1)])
+
+    # Mark this replica as not-yet-initialized so that the new controller's
+    # async `was_initialized` probe will return False.
+    uninitialized_replicas_context.add(replica_id)
+
+    new_dsm = create_dsm([replica_id.to_full_id_str()])
+    new_ds = new_dsm._deployment_states[TEST_DEPLOYMENT_ID]
+
+    # `recover()` is non-blocking: the replica enters RECOVERING and the
+    # probe is observed in the reconcile loop.
+    check_counts(new_ds, total=1, by_state=[(ReplicaState.RECOVERING, 1, v1)])
+    starting_failures_before = new_ds._replica_constructor_retry_counter
+
+    # Next update cycle: probe says False -> the replica is force-stopped
+    # (STOPPING) and a fresh replica is started in its place (STARTING) in
+    # the same reconcile pass.
+    new_dsm.update()
+    check_counts(
+        new_ds,
+        total=2,
+        by_state=[(ReplicaState.STOPPING, 1, v1), (ReplicaState.STARTING, 1, v1)],
+    )
+    # The drop must not bump the deploy-failure counter -- the underlying
+    # cause is a previous controller crash, not user code.
+    assert new_ds._replica_constructor_retry_counter == starting_failures_before
+    # The fresh replica should have a new replica id.
+    starting_replicas = new_ds._replicas.get(states=[ReplicaState.STARTING])
+    assert len(starting_replicas) == 1
+    assert starting_replicas[0].replica_id != replica_id
+
+    # Drain the STOPPING replica and confirm we're left with just the
+    # replacement.
+    stopping_replica = new_ds._replicas.get(states=[ReplicaState.STOPPING])[0]
+    stopping_replica._actor.set_done_stopping()
+    new_dsm.update()
+    check_counts(new_ds, total=1, by_state=[(ReplicaState.STARTING, 1, v1)])
+
+    uninitialized_replicas_context.remove(replica_id)
+
+
 def test_actor_died_before_recover(mock_deployment_state_manager):
     """Test replica actor died before controller could recover it.
 
@@ -3996,6 +4158,58 @@ def test_shutdown(mock_deployment_state_manager):
 
     # After all deployments shutdown, `is_ready_for_shutdown()` should return True
     assert dsm.is_ready_for_shutdown()
+
+
+def test_shutdown_blocks_deploy(mock_deployment_state_manager):
+    """After shutdown, deploy() should be a no-op and not create new deployments."""
+    create_dsm, timer, _, _ = mock_deployment_state_manager
+    dsm = create_dsm()
+
+    dsm.shutdown()
+
+    b_info_1, _ = deployment_info(num_replicas=3)
+    assert not dsm.deploy(TEST_DEPLOYMENT_ID, b_info_1)
+    assert TEST_DEPLOYMENT_ID not in dsm._deployment_states
+
+    dsm.update()
+    assert TEST_DEPLOYMENT_ID not in dsm._deployment_states
+    assert dsm.is_ready_for_shutdown()
+
+
+def test_shutdown_blocks_autoscale(mock_deployment_state_manager):
+    """After shutdown, autoscale() should be a no-op."""
+    create_dsm, timer, _, _ = mock_deployment_state_manager
+    dsm = create_dsm()
+
+    b_info_1, _ = deployment_info()
+    dsm.deploy(TEST_DEPLOYMENT_ID, b_info_1)
+    dsm.update()
+    ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+    ds._replicas.get()[0]._actor.set_ready()
+    dsm.update()
+
+    dsm.shutdown()
+
+    assert not dsm.autoscale(TEST_DEPLOYMENT_ID, 5)
+    assert ds._target_state.target_num_replicas == 0
+
+
+def test_shutdown_blocks_set_target_num_replicas(mock_deployment_state_manager):
+    """After shutdown, set_target_num_replicas() should be a no-op."""
+    create_dsm, timer, _, _ = mock_deployment_state_manager
+    dsm = create_dsm()
+
+    b_info_1, _ = deployment_info()
+    dsm.deploy(TEST_DEPLOYMENT_ID, b_info_1)
+    dsm.update()
+    ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+    ds._replicas.get()[0]._actor.set_ready()
+    dsm.update()
+
+    dsm.shutdown()
+
+    dsm.set_target_num_replicas(TEST_DEPLOYMENT_ID, 10)
+    assert ds._target_state.target_num_replicas == 0
 
 
 def test_shutdown_does_not_delete_checkpoint(mock_deployment_state_manager):
@@ -7100,6 +7314,77 @@ class TestDeploymentRankManagerIntegrationE2E:
         # Clean up
         replica_rank_context.clear()
 
+    def test_rank_recovery_after_lightweight_reconfigure(
+        self, mock_deployment_state_manager
+    ):
+        """Lightweight reconfigure must pass the ReplicaRank object, not the int.
+
+        Regression test for the lightweight-update branch calling
+        `replica.reconfigure(version, rank=current_rank.rank)` (a bare int).
+        The replica stored the int and reported it back on controller
+        recovery, where `_recover_rank_impl` failed with
+        `'int' object has no attribute 'rank'`, leaving every surviving
+        replica without a rank and `_check_rank_consistency_impl` looping
+        "Rank system is in an invalid state".
+        """
+        create_dsm, _, _, _ = mock_deployment_state_manager
+        dsm: DeploymentStateManager = create_dsm()
+        replica_rank_context.clear()
+
+        # Deploy 3 replicas with a user_config and get them running.
+        info_1, v1 = deployment_info(num_replicas=3, version="1", user_config="1")
+        assert dsm.deploy(TEST_DEPLOYMENT_ID, info_1)
+        dsm.save_checkpoint()
+        ds: DeploymentState = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+
+        dsm.update()
+        check_counts(ds, total=3, by_state=[(ReplicaState.STARTING, 3, v1)])
+        self._set_replicas_ready(ds, [ReplicaState.STARTING])
+        dsm.update()
+        check_counts(ds, total=3, by_state=[(ReplicaState.RUNNING, 3, v1)])
+
+        # Lightweight update: same code version, new user_config. Replicas
+        # are reconfigured in place (rolling), not restarted.
+        info_2, v2 = deployment_info(num_replicas=3, version="1", user_config="2")
+        assert dsm.deploy(TEST_DEPLOYMENT_ID, info_2)
+        dsm.save_checkpoint()
+        for _ in range(10):
+            dsm.update()
+            self._set_replicas_ready(ds, [ReplicaState.UPDATING])
+        check_counts(ds, total=3, by_state=[(ReplicaState.RUNNING, 3, v2)])
+
+        # The reconfigure must have handed each replica the full ReplicaRank
+        # object; this is what replicas report back on controller recovery.
+        replicas = ds._replicas.get([ReplicaState.RUNNING])
+        for replica in replicas:
+            stored_rank = replica_rank_context[replica.replica_id.unique_id]
+            assert isinstance(
+                stored_rank, ReplicaRank
+            ), f"Replica stored {stored_rank!r} instead of a ReplicaRank"
+
+        # Simulate controller crash and recover from the live replicas.
+        replica_ids = [replica.replica_id for replica in replicas]
+        new_dsm: DeploymentStateManager = create_dsm(
+            [replica_id.to_full_id_str() for replica_id in replica_ids]
+        )
+        new_ds = new_dsm._deployment_states[TEST_DEPLOYMENT_ID]
+        check_counts(new_ds, total=3, by_state=[(ReplicaState.RECOVERING, 3, v2)])
+        self._set_replicas_ready(new_ds, [ReplicaState.RECOVERING])
+        new_dsm.update()
+        check_counts(new_ds, total=3, by_state=[(ReplicaState.RUNNING, 3, v2)])
+
+        # Every recovered replica must have its rank restored.
+        for replica_id in replica_ids:
+            assert new_ds._rank_manager.has_replica_rank(
+                replica_id.unique_id
+            ), f"Rank for {replica_id.unique_id} was not recovered"
+        ranks_mapping = new_ds._get_replica_ranks_mapping()
+        ranks = sorted([r.rank for r in ranks_mapping.values()])
+        assert ranks == [0, 1, 2], f"Expected recovered ranks [0, 1, 2], got {ranks}"
+
+        # Clean up
+        replica_rank_context.clear()
+
     def test_complex_reassignment_scenario(self, mock_deployment_state_manager):
         """Test complex reassignment with many gaps through deployment state manager."""
         create_dsm, _, _, _ = mock_deployment_state_manager
@@ -9371,6 +9656,113 @@ class TestGangDraining:
             by_state=[(ReplicaState.RUNNING, num_replicas, v1)],
         )
         assert ds.curr_status_info.status == DeploymentStatus.HEALTHY
+
+
+def _ingress_deployment_info(num_replicas=1):
+    """Like deployment_info() but marks the deployment as a direct-ingress deployment.
+
+    DeploymentInfo.ingress lives on DeploymentInfo (not DeploymentConfig), so the shared
+    deployment_info() helper -- which forwards **config_opts to DeploymentConfig -- can't
+    set it.
+    """
+    info = DeploymentInfo(
+        version="1",
+        start_time_ms=0,
+        actor_name="abc",
+        deployment_config=DeploymentConfig(num_replicas=num_replicas),
+        replica_config=ReplicaConfig.create(lambda x: x),
+        deployer_job_id="",
+        ingress=True,
+    )
+    version = DeploymentVersion(
+        "1", info.deployment_config, info.replica_config.ray_actor_options
+    )
+    return info, version
+
+
+def test_ingress_membership_version_bumps_on_add_and_removal(
+    mock_deployment_state_manager,
+):
+    """The direct-ingress port reconcile is gated on get_ingress_membership_version().
+
+    The version must advance both when an ingress replica is ADDED (so its port is
+    assigned) and when one is permanently REMOVED from the container (so its port is
+    reclaimed). The removal case is the regression: a replica leaves the running set
+    ({RUNNING, PENDING_MIGRATION}) at RUNNING->STOPPING, so comparing the running set
+    alone does NOT observe the later container removal -- yet the reconcile/prune key off
+    all container states. Without the explicit removal signal the version stays flat at
+    removal and the departed replica's port is never reclaimed.
+    """
+    create_dsm, _, _, _ = mock_deployment_state_manager
+    dsm: DeploymentStateManager = create_dsm()
+
+    info, _ = _ingress_deployment_info()
+    dsm.deploy(TEST_DEPLOYMENT_ID, info)
+    ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+
+    # A STARTING replica is not yet in the running set -> no bump.
+    v_start = dsm.get_ingress_membership_version()
+    dsm.update()
+    check_counts(ds, total=1, by_state=[(ReplicaState.STARTING, 1, None)])
+    assert dsm.get_ingress_membership_version() == v_start
+
+    # STARTING -> RUNNING adds it to the running set -> version bumps (port assigned).
+    ds._replicas.get()[0]._actor.set_ready()
+    dsm.update()
+    check_counts(ds, total=1, by_state=[(ReplicaState.RUNNING, 1, None)])
+    v_running = dsm.get_ingress_membership_version()
+    assert v_running > v_start
+
+    # Steady state: no membership change over many ticks -> version stays constant
+    # (churn-insensitive -- this is what lets the reconcile be skipped).
+    for _ in range(3):
+        dsm.update()
+    assert dsm.get_ingress_membership_version() == v_running
+
+    # Delete -> RUNNING -> STOPPING: the replica leaves the running set -> bumps once.
+    ds.delete()
+    dsm.update()
+    check_counts(ds, total=1, by_state=[(ReplicaState.STOPPING, 1, None)])
+    v_stopping = dsm.get_ingress_membership_version()
+    assert v_stopping > v_running
+
+    # Still STOPPING (not yet removed) -> no further bump.
+    dsm.update()
+    assert dsm.get_ingress_membership_version() == v_stopping
+
+    # Permanent removal from the container MUST bump again so the port is reclaimed,
+    # even though the running set already excluded the replica back at STOPPING.
+    ds._replicas.get()[0]._actor.set_done_stopping()
+    dsm.update()
+    check_counts(ds, total=0)
+    assert dsm.get_ingress_membership_version() > v_stopping
+
+
+def test_ingress_membership_version_ignores_non_ingress_deployment(
+    mock_deployment_state_manager,
+):
+    """A non-ingress deployment's replica churn must never bump the ingress version."""
+    create_dsm, _, _, _ = mock_deployment_state_manager
+    dsm: DeploymentStateManager = create_dsm()
+
+    info, _ = deployment_info()  # ingress defaults to False
+    dsm.deploy(TEST_DEPLOYMENT_ID, info)
+    ds = dsm._deployment_states[TEST_DEPLOYMENT_ID]
+
+    v0 = dsm.get_ingress_membership_version()
+    dsm.update()
+    ds._replicas.get()[0]._actor.set_ready()
+    dsm.update()  # STARTING -> RUNNING
+    check_counts(ds, total=1, by_state=[(ReplicaState.RUNNING, 1, None)])
+
+    ds.delete()
+    dsm.update()  # RUNNING -> STOPPING
+    ds._replicas.get()[0]._actor.set_done_stopping()
+    dsm.update()  # removed
+    check_counts(ds, total=0)
+
+    # A full add + removal on a non-ingress deployment: the ingress version never moved.
+    assert dsm.get_ingress_membership_version() == v0
 
 
 if __name__ == "__main__":
