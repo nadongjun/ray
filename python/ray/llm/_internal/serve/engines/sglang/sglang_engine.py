@@ -44,6 +44,9 @@ from ray.llm._internal.serve.core.protocol import RawRequestInfo
 from ray.llm._internal.serve.core.server.llm_server import (
     _merge_replica_actor_and_child_actor_bundles,
 )
+from ray.llm._internal.serve.engines.sglang.ray_metrics import (
+    configure_sglang_engine_metrics,
+)
 
 
 class SGLangPauseConfig(BaseModel):
@@ -92,6 +95,15 @@ class SGLangServer:
         self.engine_kwargs = llm_config.engine_kwargs
         self._is_paused = False
         self._sleeping_tags: set[str] = set()
+
+        # Route SGLang's engine metrics through ray.util.metrics via SGLang's
+        # ServerArgs.stat_loggers DI map (requires sglang >= 0.5.15), mirroring
+        # the vLLM backend's RayPrometheusStatLogger integration. Inject into a
+        # copy: stat_loggers holds class objects, which must not leak into
+        # llm_config.engine_kwargs where a later JSON dump would choke on them.
+        if self._llm_config.log_engine_metrics:
+            self.engine_kwargs = dict(self.engine_kwargs)
+            configure_sglang_engine_metrics(self.engine_kwargs)
 
         try:
             import sglang
