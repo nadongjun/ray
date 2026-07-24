@@ -350,7 +350,7 @@ cdef class InnerGcsClient:
                 gRPC deadline.
         """
         cdef:
-            int64_t timeout_ms = round(1000 * timeout) if timeout else -1
+            int64_t timeout_ms = round(1000 * timeout) if timeout is not None else -1
             CNodeID c_node_id = <CNodeID>CUniqueID.FromBinary(node_id)
             unordered_map[c_string, c_string] c_labels
             CRayStatus status
