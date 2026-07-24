@@ -850,4 +850,33 @@ TEST_F(GcsNodeManagerTest, TestHandleUpdateNodeLabelsUnknownNode) {
   EXPECT_FALSE(fake_raylet_client_->ReplyUpdateRayletLabels());
 }
 
+TEST_F(GcsNodeManagerTest, TestUpdateAliveNodeRefreshesLabels) {
+  gcs::GcsNodeManager node_manager(gcs_publisher_.get(),
+                                   gcs_table_storage_.get(),
+                                   *io_context_,
+                                   client_pool_.get(),
+                                   ClusterID::Nil(),
+                                   *fake_ray_event_recorder_,
+                                   "test_session_name",
+                                   observability_publisher_.get(),
+                                   clock_);
+  auto node = GenNodeInfo();
+  (*node->mutable_labels())["tier"] = "cpu";
+  auto node_id = NodeID::FromBinary(node->node_id());
+  node_manager.AddNode(node);
+
+  // A resource-view sync carries the raylet's authoritative label set; the cached
+  // GcsNodeInfo labels follow it. This makes runtime label updates converge even if
+  // an UpdateNodeLabels raylet reply was applied to the cache out of order.
+  rpc::syncer::ResourceViewSyncMessage sync_message;
+  (*sync_message.mutable_labels())["tier"] = "gpu";
+  node_manager.UpdateAliveNode(node_id, sync_message);
+
+  auto stored = node_manager.GetAliveNode(node_id);
+  ASSERT_TRUE(stored.has_value());
+  const auto &labels = stored.value()->labels();
+  EXPECT_EQ(labels.size(), 1);
+  EXPECT_EQ(labels.at("tier"), "gpu");
+}
+
 }  // namespace ray

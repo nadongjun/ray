@@ -840,6 +840,12 @@ void GcsNodeManager::UpdateAliveNode(
   auto current_snapshot_state = new_node_info.state_snapshot().state();
   auto *snapshot = new_node_info.mutable_state_snapshot();
 
+  // Keep the cached labels in sync with the raylet's authoritative label set. This
+  // makes runtime label updates converge even if an UpdateNodeLabels raylet reply is
+  // delivered out of order (e.g. after a retry), and restores dynamic labels after a
+  // GCS restart re-registers the node with its startup labels.
+  *new_node_info.mutable_labels() = resource_view_sync_message.labels();
+
   if (resource_view_sync_message.idle_duration_ms() > 0) {
     snapshot->set_state(rpc::NodeSnapshot::IDLE);
     snapshot->set_idle_duration_ms(resource_view_sync_message.idle_duration_ms());
