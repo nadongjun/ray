@@ -197,6 +197,10 @@ class RayletClientInterface {
       int64_t deadline_timestamp_ms,
       const rpc::ClientCallback<rpc::DrainRayletReply> &callback) = 0;
 
+  virtual void UpdateRayletLabels(
+      google::protobuf::Map<std::string, std::string> labels,
+      const rpc::ClientCallback<rpc::UpdateRayletLabelsReply> &callback) = 0;
+
   virtual void ResizeLocalResourceInstances(
       google::protobuf::Map<std::string, double> resources,
       const rpc::ClientCallback<rpc::ResizeLocalResourceInstancesReply> &callback) = 0;
